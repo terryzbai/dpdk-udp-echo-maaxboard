@@ -19,13 +19,17 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     gcc-aarch64-linux-gnu \
     g++-aarch64-linux-gnu \
+    python3 \
+    python3-pip \
     pkg-config \
-    libdpdk-dev \
     cmake \
+    ninja-build \
+    meson \
+    linux-headers-generic \
     && rm -rf /var/lib/apt/lists/*
 
 # Install meson build system
-# RUN pip3 install meson pyelftools
+RUN pip3 install pyelftools --break-system-packages
 
 RUN /bin/bash
 
