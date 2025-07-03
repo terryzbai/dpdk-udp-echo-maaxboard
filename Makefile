@@ -54,10 +54,9 @@ build_dpdk:
 	    -Dtests=false \
 	    -Dexamples= \
 	    -Denable_docs=false \
-	    -Ddisable_apps=* \
 	    -Ddisable_libs=acl,bbdev,bitratestats,bpf,cfgfile,cmdline,compressdev,cryptodev,distributor,efd,fib,flow_classify,graph,gro,gso,hash,ip_frag,jobstats,kni,latencystats,lpm,member,meter,metrics,power,rawdev,regexdev,reorder,sched,security,table,timer \
 	    -Ddisable_drivers=baseband,compress,crypto,event,net/af_packet,net/af_xdp,net/ark,net/atlantic,net/avp,net/axgbe,net/bnx2x,net/bnxt,net/bond,net/cxgbe,net/dpaa,net/dpaa2,net/e1000,net/ena,net/enetc,net/enic,net/failsafe,net/fm10k,net/hinic,net/hns3,net/i40e,net/iavf,net/ice,net/igc,net/ionic,net/ixgbe,net/kni,net/liquidio,net/memif,net/mlx4,net/mlx5,net/netvsc,net/nfp,net/null,net/octeontx,net/octeontx2,net/pcap,net/pfe,net/qede,net/ring,net/sfc,net/softnic,net/tap,net/thunderx,net/txgbe,net/vdev_netvsc,net/vhost,net/vmxnet3,raw,regex,vdpa \
-	    -Denable_drivers=net/virtio && \
+	    -Denable_drivers=net/virtio,net/enetfec && \
 	ninja -C $(DPDK_BUILD_DIR) && \
 	ninja install -C $(DPDK_BUILD_DIR) && \
 	mkdir -p /host/libdpdk && \

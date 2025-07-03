@@ -11,8 +11,16 @@ make docker
 ```
 make app
 ```
-3. Run application on MaaXBoard
+
+3. Mount hugepages
+
+```
+mkdir -p /mnt/huge
+mount -t hugetlbfs -o pagesize=2M none /mnt/huge
+```
+
+4. Run application on MaaXBoard
 
 ``` 
-./test_dpdk_app --no-huge --vdev='net_enetfec'
+./test_dpdk_app --vdev='net_enetfec'
 ```

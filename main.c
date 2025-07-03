@@ -29,10 +29,16 @@
 /* offload checksum calculations */
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
-        .offloads = 0,
+        .mq_mode = RTE_ETH_MQ_RX_NONE,
+        .offloads = 0, // Disable all offloads that might use ctrl queue
     },
     .txmode = {
-        .offloads = 0,
+        .mq_mode = RTE_ETH_MQ_TX_NONE,
+        .offloads = 0, // Disable all offloads
+    },
+    .intr_conf = {
+        .lsc = 0, // Disable link status change interrupt
+        .rxq = 0, // Disable RX queue interrupt
     },
 };
 
@@ -132,9 +138,11 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
     int ret;
 
     // Enable all multicast so UDP/DHCP/AP work
-    rte_eth_allmulticast_enable(port_id);
+    /* printf("Enable allmulticast mode\n"); */
+    /* rte_eth_allmulticast_enable(port_id); */
 
     // Configure ethernet
+    printf("Configure eth device\n");
     ret = rte_eth_dev_configure(port_id, RX_RING_NUM, TX_RING_NUM, &port_conf);
     if (ret != 0) {
         printf("Failed to configure ethernet device\n");
@@ -148,15 +156,6 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
         return ret;
     }
 
-    /* Allocate and set up 1 RX queue per Ethernet port. */
-    for (q = 0; q < RX_RING_NUM; q++) {
-        ret = rte_eth_rx_queue_setup(port_id, q, nb_rxd,
-                                     rte_eth_dev_socket_id(port_id), NULL,
-                                     mbuf_pool);
-        if (ret < 0)
-            return ret;
-    }
-
     /* Enable TX offloading */
     ret = rte_eth_dev_info_get(0, &dev_info);
     if (ret != 0) {
@@ -166,9 +165,20 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
     txconf = &dev_info.default_txconf;
 
     /* Allocate and set up 1 TX queue per Ethernet port. */
+    printf("Setting up TX queues...\n");
     for (q = 0; q < TX_RING_NUM; q++) {
         ret = rte_eth_tx_queue_setup(port_id, q, nb_txd,
                                      rte_eth_dev_socket_id(port_id), txconf);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* Allocate and set up 1 RX queue per Ethernet port. */
+    printf("Setting up RX queues...\n");
+    for (q = 0; q < RX_RING_NUM; q++) {
+        ret = rte_eth_rx_queue_setup(port_id, q, nb_rxd,
+                                     rte_eth_dev_socket_id(port_id), NULL,
+                                     mbuf_pool);
         if (ret < 0)
             return ret;
     }
@@ -182,12 +192,13 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
     mac_addr.addr_bytes[4] = 0xcd;
     mac_addr.addr_bytes[5] = 0x60;
 
-    ret= rte_eth_dev_default_mac_addr_set(0, &mac_addr);
-    if (ret!= 0) {
-        printf("Warning: Could not set MAC address: %s\n", strerror(-ret));
-    }
+    /* ret= rte_eth_dev_default_mac_addr_set(0, &mac_addr); */
+    /* if (ret!= 0) { */
+    /*     printf("Warning: Could not set MAC address: %s\n", strerror(-ret)); */
+    /* } */
 
     /* Start the Ethernet port. */
+    printf("Start the eth dev.\n");
     ret = rte_eth_dev_start(port_id);
     if (ret < 0) {
         printf("Failed to start ethernet device\n");
@@ -195,7 +206,7 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
     }
 
     /* Enable RX in promiscuous mode for the Ethernet device. */
-    rte_eth_promiscuous_enable(port_id);
+    /* rte_eth_promiscuous_enable(port_id); */
 
     return 0;
 }
@@ -396,8 +407,10 @@ int main(int argc, char *argv[])
         printf("The target port %u is not valid\n", DPDK_PORT);
         return -1;
     }
+    printf("Port %d is valid.\n", DPDK_PORT);
 
     // Allocate rx mempool
+    printf("Creating mbuf_pool for RX...\n");
     assert((pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_rx_pool",
                                                    NUM_MBUFS,
                                                    MBUF_CACHE_SIZE,
@@ -410,6 +423,7 @@ int main(int argc, char *argv[])
     }
 
     // Allocate tx mempool
+    printf("Creating mbuf_pool for TX...\n");
     assert((tx_mbuf_pool = rte_pktmbuf_pool_create("mbuf_tx_pool",
                                                    NUM_MBUFS,
                                                    MBUF_CACHE_SIZE,
@@ -422,12 +436,13 @@ int main(int argc, char *argv[])
     }
 
 
+    printf("Initialising the port %d\n", DPDK_PORT);
     ret = port_init(DPDK_PORT, pktmbuf_pool);
     if (ret != 0) {
         printf("Faield to init port %u\n", DPDK_PORT);
         return -1;
     }
-    printf("ENETFEC initialisation successful!\n");
+    printf("Network device initialisation successful!\n");
 
     print_dev_info(DPDK_PORT);
     run_udp_echoserver(DPDK_PORT);

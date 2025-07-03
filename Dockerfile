@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     meson \
     linux-headers-generic \
+    pciutils \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install meson build system
