@@ -212,119 +212,188 @@ static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
 }
 
 /* Convert IP address to string */
-static void ip_to_str(uint32_t ip, char *str)
+static void be_ip_to_str(uint32_t ip, char *str)
 {
     sprintf(str, "%d.%d.%d.%d",
-            (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
-            (ip >> 8) & 0xFF, ip & 0xFF);
+            ip & 0xFF, (ip >> 8) & 0xFF,
+            (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
 }
 
 static void handle_arp_packet(struct rte_mbuf *mbuf, uint16_t port_id)
 {
     struct rte_ether_hdr *eth_hdr;
     struct rte_arp_hdr *arp_hdr;
-
-    char ip_str[16];
+    uint32_t src_ip, dst_ip;
+    char src_ip_str[16];
+    char dst_ip_str[16];
+    struct rte_ether_addr src_mac;
+    struct rte_ether_addr dst_mac;
 
     eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
     arp_hdr = (struct rte_arp_hdr *)(eth_hdr + 1);
 
-    ip_to_str(arp_hdr->arp_data.arp_tip, ip_str);
-    printf("Received ARP request for IP: %s\n", ip_str);
-    /* Check if it's an ARP request for our IP */
-    if (rte_be_to_cpu_16(arp_hdr->arp_opcode) == RTE_ARP_OP_REQUEST &&
-        arp_hdr->arp_data.arp_tip == config.server_ip) {
+    /* rte_eth_macaddr_get(port_id, &src_mac); */
+    rte_ether_addr_copy(&arp_hdr->arp_data.arp_tha, &src_mac);
+    rte_ether_addr_copy(&arp_hdr->arp_data.arp_sha, &dst_mac);
 
-        printf("Received ARP request for our IP, sending reply\n");
+    printf("  SRC MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+       src_mac.addr_bytes[0], src_mac.addr_bytes[1],
+       src_mac.addr_bytes[2], src_mac.addr_bytes[3],
+       src_mac.addr_bytes[4], src_mac.addr_bytes[5]);
+
+    printf("  DST MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+       dst_mac.addr_bytes[0], dst_mac.addr_bytes[1],
+       dst_mac.addr_bytes[2], dst_mac.addr_bytes[3],
+       dst_mac.addr_bytes[4], dst_mac.addr_bytes[5]);
+
+    src_ip = arp_hdr->arp_data.arp_tip;
+    dst_ip = arp_hdr->arp_data.arp_sip;
+    be_ip_to_str(src_ip, src_ip_str);
+    be_ip_to_str(dst_ip, dst_ip_str);
+
+    /* Check if it's an ARP request for our IP: */
+    /*   arp_hdr->arp_data.arp_tip == config.server_ip */
+
+    if (rte_be_to_cpu_16(arp_hdr->arp_opcode) == RTE_ARP_OP_REQUEST) {
+        rte_ether_addr_copy(&dst_mac, &eth_hdr->dst_addr);
+        rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
+
+        arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+
+        // ARP data
+        rte_ether_addr_copy(&src_mac, &arp_hdr->arp_data.arp_sha);
+        arp_hdr->arp_data.arp_sip = src_ip;
+        rte_ether_addr_copy(&dst_mac, &arp_hdr->arp_data.arp_tha);
+        arp_hdr->arp_data.arp_tip = dst_ip;
+
+        rte_eth_tx_burst(port_id, 0, &mbuf, 1);
+        printf("ARP ACK from src %s to dst %s\n", src_ip_str, dst_ip_str);
+        printf("------------------\n");
+    }
+}
+
+static void
+print_udp_info(struct rte_ipv4_hdr *ipv4_hdr, struct rte_udp_hdr *udp_hdr,
+               const uint8_t *data, uint16_t data_len, const char *direction)
+{
+    printf("[%s] %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (%d bytes): ",
+           direction,
+           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 24) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 16) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 8) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 0) & 0xFF,
+           rte_be_to_cpu_16(udp_hdr->src_port),
+           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 24) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 16) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 8) & 0xFF,
+           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 0) & 0xFF,
+           rte_be_to_cpu_16(udp_hdr->dst_port),
+           data_len);
+
+    // Print data as string if printable
+    bool printable = true;
+    for (int i = 0; i < data_len; i++) {
+        if (!isprint(data[i]) && data[i] != '\n' && data[i] != '\r' && data[i] != '\t') {
+            printable = false;
+            break;
+        }
+    }
+
+    if (printable && data_len > 0) {
+        printf("\"");
+        for (int i = 0; i < data_len; i++) {
+            if (data[i] == '\n') printf("\\n");
+            else if (data[i] == '\r') printf("\\r");
+            else if (data[i] == '\t') printf("\\t");
+            else printf("%c", data[i]);
+        }
+        printf("\"\n");
+    } else {
+        printf("[");
+        for (int i = 0; i < data_len && i < 32; i++) {
+            printf("%02x%s", data[i], (i < data_len - 1) ? " " : "");
+        }
+        if (data_len > 32) printf("...");
+        printf("]\n");
+    }
+}
+
+static void echo_udp_packet(struct rte_mbuf *pkt, uint16_t port_id)
+{
+    struct rte_ether_hdr *eth_hdr;
+    struct rte_ipv4_hdr *ipv4_hdr;
+    struct rte_udp_hdr *udp_hdr;
+    uint8_t *udp_data;
+    uint16_t udp_data_len;
+
+    eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + sizeof(struct rte_ether_hdr));
+    udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + (ipv4_hdr->version_ihl & 0x0F) * 4);
+
+    // Get UDP data
+    udp_data = (uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr);
+    udp_data_len = rte_be_to_cpu_16(udp_hdr->dgram_len) - sizeof(struct rte_udp_hdr);
+
+    // Print received packet info
+    print_udp_info(ipv4_hdr, udp_hdr, udp_data, udp_data_len, "RX");
+
+    // Swap Ethernet addresses
+    struct rte_ether_addr tmp_eth;
+    rte_ether_addr_copy(&eth_hdr->dst_addr, &tmp_eth);
+    rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+    rte_ether_addr_copy(&tmp_eth, &eth_hdr->src_addr);
+
+    // Swap IP addresses
+    uint32_t tmp_ip = ipv4_hdr->src_addr;
+    ipv4_hdr->src_addr = ipv4_hdr->dst_addr;
+    ipv4_hdr->dst_addr = tmp_ip;
+
+    // Swap UDP ports
+    uint16_t tmp_port = udp_hdr->src_port;
+    udp_hdr->src_port = udp_hdr->dst_port;
+    udp_hdr->dst_port = tmp_port;
+
+    // Recalculate checksums
+    ipv4_hdr->hdr_checksum = 0;
+    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
+
+    udp_hdr->dgram_cksum = 0;
+    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, udp_hdr);
+
+    // Print echo packet info
+    print_udp_info(ipv4_hdr, udp_hdr, udp_data, udp_data_len, "TX");
+
+    // Send the packet back
+    uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &pkt, 1);
+    if (nb_tx == 0) {
+        printf("Failed to send echo packet\n");
+        rte_pktmbuf_free(pkt);
     }
 }
 
 static void handle_udp_packet(struct rte_mbuf *mbuf, uint16_t port_id)
 {
-
-}
-
-void run_udp_sender(uint16_t port_id)
-{
-    uint64_t start_time, end_time;
-    struct rte_mbuf *bufs[BURST_SIZE];
-    struct rte_mbuf *buf;
-    struct rte_ether_hdr *ptr_mac_hdr;
-    char *buf_ptr;
     struct rte_ether_hdr *eth_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
-    struct rte_udp_hdr *rte_udp_hdr;
-    uint32_t nb_tx, nb_rx, i;
-    uint64_t reqs = 0;
-    struct rte_ether_addr server_eth;
-    char mac_buf[64];
-    uint64_t time_received;
-    int ret;
+    struct rte_udp_hdr *udp_hdr;
+    uint8_t *udp_data;
+    uint16_t udp_data_len;
 
-    buf = rte_pktmbuf_alloc(tx_mbuf_pool);
-    if (buf == NULL)
-        printf("error allocating tx mbuf\n");
+    eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + sizeof(struct rte_ether_hdr));
+    udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + (ipv4_hdr->version_ihl & 0x0F) * 4);
 
-    /* ethernet header */
-    buf_ptr = rte_pktmbuf_append(buf, RTE_ETHER_HDR_LEN);
-    eth_hdr = (struct rte_ether_hdr *) buf_ptr;
+    // Calculate UDP data pointer and length
+    udp_data = (uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr);
+    udp_data_len = rte_be_to_cpu_16(udp_hdr->dgram_len) - sizeof(struct rte_udp_hdr);
 
-    struct rte_ether_addr mac_addr;
-    ret = rte_eth_macaddr_get(port_id, &mac_addr);
-    if (ret) {
-        printf("Failed to get mac address\n");
+    // Print UDP data
+    if (udp_data_len > 0) {
+        echo_udp_packet(mbuf, port_id);
+    } else {
+        printf("No UDP data\n");
     }
-    rte_ether_addr_copy(&mac_addr, &eth_hdr->src_addr);
-
-    /* Set a proper MAC address */
-    struct rte_ether_addr server_mac_addr;
-    mac_addr.addr_bytes[0] = 0xff;
-    mac_addr.addr_bytes[1] = 0xff;
-    mac_addr.addr_bytes[2] = 0xff;
-    mac_addr.addr_bytes[3] = 0xff;
-    mac_addr.addr_bytes[4] = 0xff;
-    mac_addr.addr_bytes[5] = 0xff;
-    rte_ether_addr_copy(&server_mac_addr, &eth_hdr->dst_addr);
-
-    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-
-    /* IPv4 header */
-    buf_ptr = rte_pktmbuf_append(buf, sizeof(struct rte_ipv4_hdr));
-    ipv4_hdr = (struct rte_ipv4_hdr *) buf_ptr;
-    ipv4_hdr->version_ihl = 0x45;
-    ipv4_hdr->type_of_service = 0;
-    ipv4_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
-            sizeof(struct rte_udp_hdr) + PAYLOAD_LEN);
-    ipv4_hdr->packet_id = 0;
-    ipv4_hdr->fragment_offset = 0;
-    ipv4_hdr->time_to_live = 64;
-    ipv4_hdr->next_proto_id = IPPROTO_UDP;
-    ipv4_hdr->hdr_checksum = 0;
-    ipv4_hdr->src_addr = rte_cpu_to_be_32(CLIENT_IP);
-    ipv4_hdr->dst_addr = rte_cpu_to_be_32(SERVER_IP);
-
-    /* UDP header + fake data */
-    buf_ptr = rte_pktmbuf_append(buf,
-            sizeof(struct rte_udp_hdr) + PAYLOAD_LEN);
-    rte_udp_hdr = (struct rte_udp_hdr *) buf_ptr;
-    rte_udp_hdr->src_port = rte_cpu_to_be_16(CLIENT_PORT);
-    rte_udp_hdr->dst_port = rte_cpu_to_be_16(SERVER_PORT);
-    rte_udp_hdr->dgram_len = rte_cpu_to_be_16(sizeof(struct rte_udp_hdr)
-            + PAYLOAD_LEN);
-    rte_udp_hdr->dgram_cksum = 0;
-    memset(buf_ptr + sizeof(struct rte_udp_hdr), 0xAB, PAYLOAD_LEN);
-
-    buf->l2_len = RTE_ETHER_HDR_LEN;
-    buf->l3_len = sizeof(struct rte_ipv4_hdr);
-    buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
-
-    /* send packet */
-    nb_tx = rte_eth_tx_burst(port_id, 0, &buf, 1);
-    printf("Sent a packet\n");
-
-    if (unlikely(nb_tx != 1)) {
-        printf("error: could not send packet\n");
-    }
+    printf("===========================\n");
 }
 
 void run_udp_echoserver(uint16_t port_id)
@@ -349,8 +418,6 @@ void run_udp_echoserver(uint16_t port_id)
         if (nb_rx == 0) // If no packets were received, continue to the next iteration
             continue;
 
-        printf("received a packet!\n");
-
         /* Process each packet */
         for (i = 0; i < nb_rx; i++) {
             struct rte_ether_hdr *eth_hdr;
@@ -358,6 +425,8 @@ void run_udp_echoserver(uint16_t port_id)
 
             eth_hdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
             ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+
+            printf("received a packet - type: 0x%x!\n", ether_type);
 
             if (ether_type == RTE_ETHER_TYPE_ARP) {
                 handle_arp_packet(bufs[i], port_id);
@@ -373,7 +442,6 @@ void run_udp_echoserver(uint16_t port_id)
                 rte_pktmbuf_free(bufs[i]);
             }
         }
-
     }
 }
 
