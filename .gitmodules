@@ -1,0 +1,7 @@
+[submodule "lwip"]
+    path = lwip
+    url = https://github.com/lwip-tcpip/lwip.git
+    branch = STABLE-2_1_2_RELEASE
+[submodule "lwip-contrib"]
+	path = lwip-contrib
+	url = https://git.savannah.gnu.org/git/lwip/lwip-contrib.git

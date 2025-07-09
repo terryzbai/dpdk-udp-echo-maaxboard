@@ -22,7 +22,7 @@ endif
 
 .PHONY: app
 app:
-	$(CC) -o test_dpdk_app main.c \
+	$(CC) -o test_dpdk_app test_dpdk_app.c \
 	    $(shell pkg-config --cflags libdpdk) \
 	    $(shell pkg-config --libs libdpdk) \
 	    -pthread

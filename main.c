@@ -92,6 +92,18 @@ static void tx_flush(void)
     // print packet
     #ifdef DEBUG
     printf("Emitted %d packets\n", emitted);
+
+    uint8_t *udp_data = (uint8_t *)rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *);
+    uint16_t len = rte_pktmbuf_pkt_len(tx_mbufs[mbuf_count]);
+    printf("==============udp data==============\n");
+    // Print packet
+    for (int i = 0; i < len; i++)
+    {
+        printf("%02x ", udp_data[i]);
+        if (i % 16 == 15)
+            printf("\n");
+    }
+
     #endif
 }
 
@@ -128,8 +140,8 @@ static err_t tx_output(struct netif *netif __attribute__((unused)), struct pbuf 
 
     const uint32_t offloads = RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM | RTE_MBUF_F_TX_UDP_CKSUM;
     assert((tx_mbufs[mbuf_count] = rte_pktmbuf_alloc(pktmbuf_pool)) != NULL);
-    /* tx_mbufs[mbuf_count]->ol_flags |= offloads; */
-    tx_mbufs[mbuf_count]->ol_flags = 0;
+    tx_mbufs[mbuf_count]->ol_flags |= offloads;
+    /* tx_mbufs[mbuf_count]->ol_flags = 0; */
     /* tx_mbufs[mbuf_count]->l2_len = sizeof(struct rte_ether_hdr); */
     tx_mbufs[mbuf_count]->l2_len = 0;
     /* tx_mbufs[mbuf_count]->l3_len = sizeof(struct rte_ipv4_hdr); */
@@ -138,24 +150,17 @@ static err_t tx_output(struct netif *netif __attribute__((unused)), struct pbuf 
     // Generate checksums
     struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(tx_mbufs[mbuf_count], struct rte_ether_hdr *);
     struct rte_ipv4_hdr *ip_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
-    struct udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct udp_hdr *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
+    struct rte_udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct rte_udp_hdr *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
 
     printf("\nbuf: 0x%x 0x%x\n", ((unsigned char *)bufptr)[70], ((unsigned char *)bufptr)[71]);
-    // Generate header fields
-    #ifdef HW_NO_CKSUM_OFFLOAD
-    // case for offload unavailable
-    udp_hdr->chksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
-    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
-    #else
-    // case for offload available
-    udp_hdr->chksum = rte_ipv4_phdr_cksum(ip_hdr, offloads);
-    ip_hdr->hdr_checksum = 0;
-    #endif
-
 
     assert(p->tot_len <= RTE_MBUF_DEFAULT_BUF_SIZE);
     rte_memcpy(rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *), bufptr, p->tot_len);
     rte_pktmbuf_pkt_len(tx_mbufs[mbuf_count]) = rte_pktmbuf_data_len(tx_mbufs[mbuf_count]) = p->tot_len;
+
+    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
+    /* ip_hdr->hdr_checksum = 0; */
+    printf("ip cksum: 0x%x\n", rte_be_to_cpu_32(rte_ipv4_cksum(ip_hdr)));
 
     printf("ether hdr address: 0x%x\n", eth_hdr);
     printf("ipv4 hdr address: 0x%x\n", ip_hdr);
@@ -166,7 +171,6 @@ static err_t tx_output(struct netif *netif __attribute__((unused)), struct pbuf 
     /* uint8_t *udp_data = ((uint8_t *)ip_hdr + (ip_hdr->version_ihl & 0x0F) * 4) + sizeof(struct rte_udp_hdr); */
     uint8_t *udp_data = (uint8_t *)rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *);
     printf("data address (rte_udp_hdr): 0x%x\n", udp_data);
-
 
 #ifdef DEBUG
     printf("==============udp data==============\n");
