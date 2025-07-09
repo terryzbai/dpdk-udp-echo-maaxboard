@@ -40,6 +40,7 @@ docker: build_img
 		-v $(ETC_LOCALTIME):/etc/localtime:ro \
 		$(USER_IMG) $(EXEC)
 
+.PHONY: build_dpdk
 build_dpdk:
 	cd $(HOST_DIR)/dpdk && \
 	PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig \
@@ -75,6 +76,92 @@ build_img:
 		--build-arg=GROUP=$(shell id -gn) \
 		-f Dockerfile \
 		-t $(USER_IMG) .
+
+CFLAGS = -O0
+CFLAGS += -Wall -Wunused-function
+CFLAGS += -Wextra -I. -Iinclude
+LDFLAGS += -lpthread -lm
+
+CFLAGS += $(shell pkg-config --cflags libdpdk)
+LDFLAGS += $(shell pkg-config --libs libdpdk)
+C_SRCS = main.c udpecho.c
+C_OBJS = $(C_SRCS:.c=.o)
+
+LWIP_SRC_DIR = $(ROOT_DIR)/lwip
+CONTRIB_SRC_DIR = $(ROOT_DIR)/lwip-contrib
+CFLAGS += -I$(LWIP_SRC_DIR)/src/include -I$(CONTRIB_SRC_DIR) -I$(CONTRIB_SRC_DIR)/ports/unix/port/include
+LWIP_OBJS = $(LWIP_SRC_DIR)/src/api/api_lib.o \
+			$(LWIP_SRC_DIR)/src/api/api_msg.o \
+			$(LWIP_SRC_DIR)/src/api/err.o \
+			$(LWIP_SRC_DIR)/src/api/if_api.o \
+			$(LWIP_SRC_DIR)/src/api/netbuf.o \
+			$(LWIP_SRC_DIR)/src/api/netdb.o \
+			$(LWIP_SRC_DIR)/src/api/netifapi.o \
+			$(LWIP_SRC_DIR)/src/api/sockets.o \
+			$(LWIP_SRC_DIR)/src/api/tcpip.o \
+			$(LWIP_SRC_DIR)/src/core/altcp_alloc.o \
+			$(LWIP_SRC_DIR)/src/core/altcp.o \
+			$(LWIP_SRC_DIR)/src/core/altcp_tcp.o \
+			$(LWIP_SRC_DIR)/src/core/def.o \
+			$(LWIP_SRC_DIR)/src/core/dns.o \
+			$(LWIP_SRC_DIR)/src/core/inet_chksum.o \
+			$(LWIP_SRC_DIR)/src/core/init.o \
+			$(LWIP_SRC_DIR)/src/core/ip.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/autoip.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/dhcp.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/etharp.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/icmp.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/igmp.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/ip4_addr.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/ip4.o \
+			$(LWIP_SRC_DIR)/src/core/ipv4/ip4_frag.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/dhcp6.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/ethip6.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/icmp6.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/inet6.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/ip6_addr.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/ip6.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/ip6_frag.o \
+			$(LWIP_SRC_DIR)/src/core/ipv6/mld6.o  \
+			$(LWIP_SRC_DIR)/src/core/ipv6/nd6.o   \
+			$(LWIP_SRC_DIR)/src/core/mem.o \
+			$(LWIP_SRC_DIR)/src/core/memp.o \
+			$(LWIP_SRC_DIR)/src/core/netif.o \
+			$(LWIP_SRC_DIR)/src/core/pbuf.o \
+			$(LWIP_SRC_DIR)/src/core/raw.o \
+			$(LWIP_SRC_DIR)/src/core/stats.o \
+			$(LWIP_SRC_DIR)/src/core/sys.o \
+			$(LWIP_SRC_DIR)/src/core/tcp.o \
+			$(LWIP_SRC_DIR)/src/core/tcp_in.o \
+			$(LWIP_SRC_DIR)/src/core/tcp_out.o \
+			$(LWIP_SRC_DIR)/src/core/timeouts.o \
+			$(LWIP_SRC_DIR)/src/core/udp.o \
+			$(LWIP_SRC_DIR)/src/netif/ethernet.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/ppp.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/pppoe.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/auth.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/ccp.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/chap_ms.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/demand.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/eap.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/ecp.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/fsm.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/lcp.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/pppapi.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/utils.o \
+			$(LWIP_SRC_DIR)/src/netif/ppp/mppe.o \
+			$(CONTRIB_SRC_DIR)/ports/unix/port/sys_arch.o
+
+OBJS = $(C_OBJS) $(LWIP_OBJS)
+$(OBJS): $(CONTRIB_SRC_DIR) $(LWIP_SRC_DIR)
+
+.PHONY: udp_echo
+udp_echo: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+clean_udp_echo:
+	rm -rf $(OBJS)
+
 
 clean:
 	rm -rf $(BUILD_DIR)

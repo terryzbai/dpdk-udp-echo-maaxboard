@@ -1,542 +1,540 @@
-// test_enetfec_fixed.c
-#include <rte_eal.h>
-#include <rte_ethdev.h>
-#include <rte_bus_vdev.h>
-#include <stdio.h>
-#include <signal.h>
+/*
+ * Copyright 2023, UNSW
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+// DPDK echo server - single-threaded over LWIP
+// Matt Rossouw (omeh-a)
+// 07/2023
 
-#define RX_RING_NUM 1
-#define TX_RING_NUM 1
-#define RX_RING_SIZE 128
-#define TX_RING_SIZE 128
+// Uncomment below for debugging output
+#define DEBUG
 
-/* #define NUM_MBUFS 8191 */
-#define NUM_MBUFS 4000
-#define MBUF_CACHE_SIZE 250
-#define BURST_SIZE 32
+// Uncomment below for zero copy LWIP - note that this inexplicably makes things slower
+// #define ZEROCOPY
 
-#define IP_ADDR(a, b, c, d)                           \
-    (((uint32_t) a << 24) | ((uint32_t) b << 16) |    \
-     ((uint32_t) c << 8) | (uint32_t) d)
+// Uncomment below for artificial per-burst delay. You can set number of cycles delay with this
+#define BURST_DELAY 10UL
+#define HW_NO_CKSUM_OFFLOAD
 
-#define DPDK_PORT 0
-#define CLIENT_IP IP_ADDR(172, 16, 1, 100)
-#define CLIENT_PORT 1235
-#define SERVER_IP IP_ADDR(255, 255, 255, 255)
-#define SERVER_PORT 1235
-#define PAYLOAD_LEN 22
-
-/* offload checksum calculations */
-static const struct rte_eth_conf port_conf = {
-    .rxmode = {
-        .mq_mode = RTE_ETH_MQ_RX_NONE,
-        .offloads = 0, // Disable all offloads that might use ctrl queue
-    },
-    .txmode = {
-        .mq_mode = RTE_ETH_MQ_TX_NONE,
-        .offloads = 0, // Disable all offloads
-    },
-    .intr_conf = {
-        .lsc = 0, // Disable link status change interrupt
-        .rxq = 0, // Disable RX queue interrupt
-    },
-};
-
-/* Server configuration */
-struct server_config {
-    uint32_t server_ip;     /* Server IP in network byte order */
-    struct rte_ether_addr server_mac;
-    struct rte_ether_addr client_mac;  /* Will be learned from first packet */
-    uint16_t udp_port;
-    bool client_learned;
-};
-
-static struct server_config config = {
-    .server_ip = RTE_IPV4(172, 16, 1, 100),  /* Default server IP */
-    .udp_port = SERVER_PORT,
-    .client_learned = false
-};
+#include "main.h"
 
 static struct rte_mempool *pktmbuf_pool = NULL;
-static struct rte_mempool *tx_mbuf_pool = NULL;
+static int mbuf_count = 0;
+static struct rte_mbuf *tx_mbufs[MAX_PKT_BURST] = {0};
+ 
+static uint8_t _mac[6];
 
-void print_dev_info(uint16_t port_id)
+static inline void *lwip_timeouts_thread(void *arg __attribute__((unused)))
 {
-    struct rte_eth_dev_info dev_info;
-    struct rte_ether_addr mac_addr;
-    int ret;
-
-    printf("=== Port %u ===\n", port_id);
-
-    // Get device info safely
-    ret = rte_eth_dev_info_get(port_id, &dev_info);
-    if (ret == 0) {
-        printf("  Driver: %s\n",
-               dev_info.driver_name ? dev_info.driver_name : "Unknown");
-        printf("  Max RX queues: %u\n", dev_info.max_rx_queues);
-        printf("  Max TX queues: %u\n", dev_info.max_tx_queues);
-    } else {
-        printf("  Failed to get device info: %d\n", ret);
+    for (;;)
+    {
+        sys_check_timeouts();
+        usleep(ARP_TMR_INTERVAL * 1000);
     }
-
-    // Get MAC address safely
-    ret = rte_eth_macaddr_get(port_id, &mac_addr);
-    if (ret == 0) {
-        printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-               mac_addr.addr_bytes[0], mac_addr.addr_bytes[1],
-               mac_addr.addr_bytes[2], mac_addr.addr_bytes[3],
-               mac_addr.addr_bytes[4], mac_addr.addr_bytes[5]);
-    } else {
-        printf("  Failed to get MAC address: %d\n", ret);
-    }
-
-    // Check if port is valid
-    if (rte_eth_dev_is_valid_port(port_id)) {
-        printf("  Port is valid\n");
-    } else {
-        printf("  Port is invalid\n");
-    }
-
-    /* RX Offload Capabilities */
-    printf("\nRX Offload Capabilities:\n");
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_VLAN_STRIP)
-        printf("   VLAN_STRIP\n");
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM)
-        printf("   IPV4_CKSUM\n");
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
-        printf("   UDP_CKSUM\n");
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_CKSUM)
-        printf("   TCP_CKSUM\n");
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER)
-        printf("   SCATTER\n");
-    printf("========END=======\n");
-
-    /* TX Offload Capabilities */
-    printf("\nTX Offload Capabilities:\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_VLAN_INSERT)
-        printf("   VLAN_INSERT\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
-        printf("   IPV4_CKSUM\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
-        printf("   UDP_CKSUM\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)
-        printf("   TCP_CKSUM\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
-        printf("   TCP_TSO\n");
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)
-        printf("   MULTI_SEGS\n");
-    printf("========END=======\n");
+    return NULL;
 }
 
-static inline int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool)
+#ifdef ZEROCOPY
+// Custom pbuf for zero copy between DPDK/LWIP
+typedef struct lwip_custom_pbuf {
+    struct pbuf_custom pbuf;
+    struct rte_mbuf *mbuf;
+} lwip_custom_pbuf_t;
+
+LWIP_MEMPOOL_DECLARE(
+    RX_POOL,
+    PACKET_BUF_SIZE,
+    sizeof(lwip_custom_pbuf_t),
+    "Zero-copy RX pool"
+);
+
+// Custom pbuf handling functions
+static void free_custom_pbuf(struct pbuf *p)
 {
-    struct rte_eth_dev_info dev_info;
-    struct rte_eth_txconf *txconf;
-    uint16_t nb_rxd = RX_RING_SIZE;
-    uint16_t nb_txd = TX_RING_SIZE;
+    lwip_custom_pbuf_t *pk = (lwip_custom_pbuf_t *)p;
+    rte_pktmbuf_free(pk->mbuf);
+    LWIP_MEMPOOL_FREE(RX_POOL, pk);
+}
+
+static struct pbuf *alloc_custom_pbuf(struct rte_mbuf *mbuf)
+{
+    lwip_custom_pbuf_t *pk = (lwip_custom_pbuf_t *)LWIP_MEMPOOL_ALLOC(RX_POOL);
+    assert(pk != NULL && "Failed to allocate custom pbuf!");
+    pk->mbuf = mbuf;
+    pk->pbuf.custom_free_function = free_custom_pbuf;
+    // buf_count++;
+    return pbuf_alloced_custom(
+        PBUF_RAW,
+        &pk->mbuf->pkt_len, // Might need to make this bigger
+        PBUF_REF,
+        &pk->pbuf,
+        rte_pktmbuf_mtod(pk->mbuf, void *),
+        &pk->mbuf->pkt_len
+    );
+}
+#endif
+
+// Yes this is cursed I know. I am sorry.
+// This has one big benefit however: it allows can be easily adapted to have a
+// concurrent queue for multiple lcores.
+static void tx_flush(void)
+{
+    int emission_index = mbuf_count;
+    int emitted = 0;
+
+    rte_wmb();
+
+    while (emitted != emission_index)
+        emitted += rte_eth_tx_burst(0, 0, &tx_mbufs[emitted], emission_index - emitted);
+
+    mbuf_count = 0;
+
+    // print packet
+    #ifdef DEBUG
+    printf("Emitted %d packets\n", emitted);
+    #endif
+}
+
+// Function to output packets for lwip
+static err_t tx_output(struct netif *netif __attribute__((unused)), struct pbuf *p)
+{
+    char buf[PACKET_BUF_SIZE];
+    void *bufptr, *largebuf = NULL;
+    if (sizeof(buf) < p->tot_len)
+    {
+        largebuf = (char *)malloc(p->tot_len);
+        assert(largebuf);
+        bufptr = largebuf;
+    }
+    else
+    {
+        bufptr = buf;
+        largebuf = NULL;
+    }
+
+    pbuf_copy_partial(p, bufptr, p->tot_len, 0);
+
+
+#ifdef DEBUG
+    printf("Packet size: %d, buffer len: %d\n", p->tot_len, p->len);
+    // Print packet
+    for (int i = 0; i < p->tot_len; i++)
+    {
+        printf("%02x ", ((unsigned char *)bufptr)[i]);
+        if (i % 16 == 15)
+            printf("\n");
+    }
+#endif
+
+    const uint32_t offloads = RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM | RTE_MBUF_F_TX_UDP_CKSUM;
+    assert((tx_mbufs[mbuf_count] = rte_pktmbuf_alloc(pktmbuf_pool)) != NULL);
+    /* tx_mbufs[mbuf_count]->ol_flags |= offloads; */
+    tx_mbufs[mbuf_count]->ol_flags = 0;
+    /* tx_mbufs[mbuf_count]->l2_len = sizeof(struct rte_ether_hdr); */
+    tx_mbufs[mbuf_count]->l2_len = 0;
+    /* tx_mbufs[mbuf_count]->l3_len = sizeof(struct rte_ipv4_hdr); */
+    tx_mbufs[mbuf_count]->l3_len = 0;
+
+    // Generate checksums
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(tx_mbufs[mbuf_count], struct rte_ether_hdr *);
+    struct rte_ipv4_hdr *ip_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+    struct udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct udp_hdr *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
+
+    printf("\nbuf: 0x%x 0x%x\n", ((unsigned char *)bufptr)[70], ((unsigned char *)bufptr)[71]);
+    // Generate header fields
+    #ifdef HW_NO_CKSUM_OFFLOAD
+    // case for offload unavailable
+    udp_hdr->chksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
+    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+    #else
+    // case for offload available
+    udp_hdr->chksum = rte_ipv4_phdr_cksum(ip_hdr, offloads);
+    ip_hdr->hdr_checksum = 0;
+    #endif
+
+
+    assert(p->tot_len <= RTE_MBUF_DEFAULT_BUF_SIZE);
+    rte_memcpy(rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *), bufptr, p->tot_len);
+    rte_pktmbuf_pkt_len(tx_mbufs[mbuf_count]) = rte_pktmbuf_data_len(tx_mbufs[mbuf_count]) = p->tot_len;
+
+    printf("ether hdr address: 0x%x\n", eth_hdr);
+    printf("ipv4 hdr address: 0x%x\n", ip_hdr);
+    printf("udp hdr address: 0x%x\n", udp_hdr);
+    printf("data address (udp_hdr): 0x%x\n", rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *));
+    struct rte_udp_hdr *test_udp_hdr = (struct rte_udp_hdr *)((char *)ip_hdr + (ip_hdr->version_ihl & 0x0F) * 4);
+    printf("rte_udp_hdr addr: 0x%x, dgram_len: %u\n", test_udp_hdr, (uint16_t)test_udp_hdr->dgram_len);
+    /* uint8_t *udp_data = ((uint8_t *)ip_hdr + (ip_hdr->version_ihl & 0x0F) * 4) + sizeof(struct rte_udp_hdr); */
+    uint8_t *udp_data = (uint8_t *)rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *);
+    printf("data address (rte_udp_hdr): 0x%x\n", udp_data);
+
+
+#ifdef DEBUG
+    printf("==============udp data==============\n");
+    // Print packet
+    for (int i = 0; i < p->tot_len; i++)
+    {
+        printf("%02x ", udp_data[i]);
+        if (i % 16 == 15)
+            printf("\n");
+    }
+#endif
+
+
+    // Enable offloads in mbufs
+    if (++mbuf_count == MAX_PKT_BURST) {
+    }
+    tx_flush();
+    if (largebuf)
+        free(largebuf);
+    return ERR_OK;
+}
+
+// LWIP interface init
+static err_t if_init(struct netif *netif)
+{
+    // Set network MTU
+    uint16_t mtu;
+    assert(rte_eth_dev_get_mtu(0 /* port id */, &mtu) >= 0);
+    assert(mtu <= PACKET_BUF_SIZE);
+    netif->mtu = mtu;
+    printf("\n\n Network MTU = %u\n\n", mtu);
+    for (int i = 0; i < 6; i++)
+        netif->hwaddr[i] = _mac[i];
+
+    // Set up everything else.
+    netif->output = etharp_output;
+    netif->linkoutput = tx_output;
+    netif->hwaddr_len = 6;
+    netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_IGMP | NETIF_FLAG_ETHERNET;
+    return ERR_OK;
+}
+
+// DPDK port init
+static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+{
+#ifdef DEBUG
+    printf("Setting up port %u\n", port);
+#endif
+    struct rte_eth_conf port_conf;
+    const uint16_t rx_rings = 1, tx_rings = 1;
+    uint16_t nb_rxd = RING_SIZE;
+    uint16_t nb_txd = RING_SIZE;
+    int retval;
     uint16_t q;
-    int ret;
+    struct rte_eth_dev_info dev_info;
+    struct rte_eth_txconf txconf;
+
+    if (!rte_eth_dev_is_valid_port(port))
+        return -1;
 
     // Enable all multicast so UDP/DHCP/AP work
-    /* printf("Enable allmulticast mode\n"); */
-    /* rte_eth_allmulticast_enable(port_id); */
+    rte_eth_allmulticast_enable(port);
 
-    // Configure ethernet
-    printf("Configure eth device\n");
-    ret = rte_eth_dev_configure(port_id, RX_RING_NUM, TX_RING_NUM, &port_conf);
-    if (ret != 0) {
-        printf("Failed to configure ethernet device\n");
-        return ret;
+    memset(&port_conf, 0, sizeof(struct rte_eth_conf));
+
+    // Get port info
+    retval = rte_eth_dev_info_get(port, &dev_info);
+    if (retval != 0)
+    {
+        printf("Error during getting device (port %u) info: %s\n",
+               port, strerror(-retval));
+        return retval;
     }
+    
+    // Set offload optimisations if available
+    /* port_conf.txmode.offloads =  */
+    /* RTE_ETH_TX_OFFLOAD_UDP_CKSUM |  */
+    /* RTE_ETH_TX_OFFLOAD_TCP_CKSUM |  */
+    /* RTE_ETH_TX_OFFLOAD_IPV4_CKSUM; */
+
+    /* port_conf.rxmode.offloads = */
+    /* RTE_ETH_RX_OFFLOAD_CHECKSUM; */
+
+
+    // // Fast free
+    // if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+    // 	port_conf.txmode.offloads |=
+    // 		RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+    // // ipv4 checksums
+    // if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
+    //     port_conf.txmode.offloads |=
+    //         RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+
+    // // udp checksums
+    // if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
+    //     port_conf.txmode.offloads |=
+    //         RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+
+    // Set up ethernet. We don't actually have anything in the struct
+    // except for the offload optimisation.
+    retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
+    if (retval != 0)
+        return retval;
 
     // Check that queue descriptors are appropriately sized
-    ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd);
-    if (ret != 0) {
-        printf("Failed to ajust queue size\n");
-        return ret;
-    }
+    retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
+    if (retval != 0)
+        return retval;
 
-    /* Enable TX offloading */
-    ret = rte_eth_dev_info_get(0, &dev_info);
-    if (ret != 0) {
-        printf("Failed to get dev info\n");
-        return -1;
-    }
-    txconf = &dev_info.default_txconf;
-
-    /* Allocate and set up 1 TX queue per Ethernet port. */
-    printf("Setting up TX queues...\n");
-    for (q = 0; q < TX_RING_NUM; q++) {
-        ret = rte_eth_tx_queue_setup(port_id, q, nb_txd,
-                                     rte_eth_dev_socket_id(port_id), txconf);
-        if (ret < 0)
-            return ret;
-    }
-
+    // Set up RX queue for each rx ring
+    // This isn't needed for all portssince we have on port
+    // dedicated to RX, other to TX
     /* Allocate and set up 1 RX queue per Ethernet port. */
-    printf("Setting up RX queues...\n");
-    for (q = 0; q < RX_RING_NUM; q++) {
-        ret = rte_eth_rx_queue_setup(port_id, q, nb_rxd,
-                                     rte_eth_dev_socket_id(port_id), NULL,
-                                     mbuf_pool);
-        if (ret < 0)
-            return ret;
+    for (q = 0; q < rx_rings; q++)
+    {
+        retval = rte_eth_rx_queue_setup(port, q, nb_rxd,
+                                        rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+        if (retval < 0)
+            return retval;
     }
 
-    /* Set a proper MAC address */
-    struct rte_ether_addr mac_addr; // b2:6f:36:15:cd:60
-    mac_addr.addr_bytes[0] = 0xb2;  /* Locally administered */
-    mac_addr.addr_bytes[1] = 0x6f;
-    mac_addr.addr_bytes[2] = 0x36;
-    mac_addr.addr_bytes[3] = 0x15;
-    mac_addr.addr_bytes[4] = 0xcd;
-    mac_addr.addr_bytes[5] = 0x60;
-
-    /* ret= rte_eth_dev_default_mac_addr_set(0, &mac_addr); */
-    /* if (ret!= 0) { */
-    /*     printf("Warning: Could not set MAC address: %s\n", strerror(-ret)); */
-    /* } */
-
-    /* Start the Ethernet port. */
-    printf("Start the eth dev.\n");
-    ret = rte_eth_dev_start(port_id);
-    if (ret < 0) {
-        printf("Failed to start ethernet device\n");
-        return ret;
+    // Same thing as above, but for TX
+    txconf = dev_info.default_txconf; // Unclear why we need this for tx but not rx
+    txconf.offloads = port_conf.txmode.offloads;
+    for (q = 0; q < tx_rings; q++)
+    {
+        retval = rte_eth_tx_queue_setup(port, q, nb_txd,
+                                        rte_eth_dev_socket_id(port), &txconf);
+        if (retval < 0)
+            return retval;
     }
 
-    /* Enable RX in promiscuous mode for the Ethernet device. */
-    /* rte_eth_promiscuous_enable(port_id); */
+    struct rte_ether_addr new_mac;
 
+// Set a specific MAC address
+    new_mac.addr_bytes[0] = 0x32;
+    new_mac.addr_bytes[1] = 0xb6;
+    new_mac.addr_bytes[2] = 0xac;
+    new_mac.addr_bytes[3] = 0xe0;
+    new_mac.addr_bytes[4] = 0xb4;
+    new_mac.addr_bytes[5] = 0x01;
+
+    retval = rte_eth_dev_default_mac_addr_set(port, &new_mac);
+    if (retval != 0) {
+        printf("Failed to set MAC address: %s\n", rte_strerror(-retval));
+        return retval;
+    }
+
+    // Kick device to start
+    retval = rte_eth_dev_start(port);
+    if (retval < 0)
+        return retval;
+
+    // Grab and print MAC
+    struct rte_ether_addr addr;
+    retval = rte_eth_macaddr_get(port, &addr);
+    if (retval != 0)
+        return retval;
+    for (int i = 0; i < 6; i++)
+        _mac[i] = addr.addr_bytes[i];
+
+    rte_eth_promiscuous_enable(port);
+
+    printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+           " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+           port, RTE_ETHER_ADDR_BYTES(&addr));
     return 0;
 }
 
-/* Convert IP address to string */
-static void be_ip_to_str(uint32_t ip, char *str)
+static void udp_recv_handler(void *arg __attribute__((unused)),
+                             struct udp_pcb *upcb,
+                             struct pbuf *p, const ip_addr_t *addr,
+                             u16_t port)
 {
-    sprintf(str, "%d.%d.%d.%d",
-            ip & 0xFF, (ip >> 8) & 0xFF,
-            (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-}
-
-static void handle_arp_packet(struct rte_mbuf *mbuf, uint16_t port_id)
-{
-    struct rte_ether_hdr *eth_hdr;
-    struct rte_arp_hdr *arp_hdr;
-    uint32_t src_ip, dst_ip;
-    char src_ip_str[16];
-    char dst_ip_str[16];
-    struct rte_ether_addr src_mac;
-    struct rte_ether_addr dst_mac;
-
-    eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-    arp_hdr = (struct rte_arp_hdr *)(eth_hdr + 1);
-
-    /* rte_eth_macaddr_get(port_id, &src_mac); */
-    rte_ether_addr_copy(&arp_hdr->arp_data.arp_tha, &src_mac);
-    rte_ether_addr_copy(&arp_hdr->arp_data.arp_sha, &dst_mac);
-
-    printf("  SRC MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-       src_mac.addr_bytes[0], src_mac.addr_bytes[1],
-       src_mac.addr_bytes[2], src_mac.addr_bytes[3],
-       src_mac.addr_bytes[4], src_mac.addr_bytes[5]);
-
-    printf("  DST MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-       dst_mac.addr_bytes[0], dst_mac.addr_bytes[1],
-       dst_mac.addr_bytes[2], dst_mac.addr_bytes[3],
-       dst_mac.addr_bytes[4], dst_mac.addr_bytes[5]);
-
-    src_ip = arp_hdr->arp_data.arp_tip;
-    dst_ip = arp_hdr->arp_data.arp_sip;
-    be_ip_to_str(src_ip, src_ip_str);
-    be_ip_to_str(dst_ip, dst_ip_str);
-
-    /* Check if it's an ARP request for our IP: */
-    /*   arp_hdr->arp_data.arp_tip == config.server_ip */
-
-    if (rte_be_to_cpu_16(arp_hdr->arp_opcode) == RTE_ARP_OP_REQUEST) {
-        rte_ether_addr_copy(&dst_mac, &eth_hdr->dst_addr);
-        rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
-
-        arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
-
-        // ARP data
-        rte_ether_addr_copy(&src_mac, &arp_hdr->arp_data.arp_sha);
-        arp_hdr->arp_data.arp_sip = src_ip;
-        rte_ether_addr_copy(&dst_mac, &arp_hdr->arp_data.arp_tha);
-        arp_hdr->arp_data.arp_tip = dst_ip;
-
-        rte_eth_tx_burst(port_id, 0, &mbuf, 1);
-        printf("ARP ACK from src %s to dst %s\n", src_ip_str, dst_ip_str);
-        printf("------------------\n");
+#ifdef DEBUG
+    printf("UDP echoing packet with length %d totallen %d\n", p->len, p->tot_len);
+#endif
+    err_t ret = udp_sendto(upcb, p, addr, port) == ERR_OK;
+    if (ret < 0)
+    {
+        printf("WARNING: failed to transmit back to client\n");
     }
+
+// Print packet
+#ifdef DEBUG
+    uint8_t *data = p->payload;
+    printf("Packet data: ");
+    for (uint16_t i = 0; i < p->len; ++i)
+    {
+        printf("%c", data[i]);
+    }
+    printf("\n");
+
+    printf("Echoing packet to %s:%d\n", ipaddr_ntoa(addr), port);
+#endif
+    pbuf_free(p);
+    // tx_flush();
 }
-
-static void
-print_udp_info(struct rte_ipv4_hdr *ipv4_hdr, struct rte_udp_hdr *udp_hdr,
-               const uint8_t *data, uint16_t data_len, const char *direction)
+struct netif netif = {0};
+static struct udp_pcb *upcb;
+// Main loop
+static __rte_noreturn void lcore_main(void)
 {
-    printf("[%s] %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (%d bytes): ",
-           direction,
-           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 24) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 16) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 8) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->src_addr) >> 0) & 0xFF,
-           rte_be_to_cpu_16(udp_hdr->src_port),
-           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 24) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 16) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 8) & 0xFF,
-           (rte_be_to_cpu_32(ipv4_hdr->dst_addr) >> 0) & 0xFF,
-           rte_be_to_cpu_16(udp_hdr->dst_port),
-           data_len);
+    // LWIP setup
+    ip4_addr_t _addr, _mask, _gate;
 
-    // Print data as string if printable
-    bool printable = true;
-    for (int i = 0; i < data_len; i++) {
-        if (!isprint(data[i]) && data[i] != '\n' && data[i] != '\r' && data[i] != '\t') {
-            printable = false;
-            break;
+    inet_pton(AF_INET, "255.255.255.0", &_mask);
+    inet_pton(AF_INET, "0.0.0.0", &_gate);
+    inet_pton(AF_INET, "0.0.0.0", &_addr);
+
+    lwip_init();
+    #ifdef ZEROCOPY
+    LWIP_MEMPOOL_INIT(RX_POOL);
+    #endif
+    assert(netif_add(&netif, &_addr, &_mask, &_gate, NULL, if_init, ethernet_input) != NULL);
+    netif_set_default(&netif);
+    netif_set_link_up(&netif);
+
+    // Create a new thread to run the lwip timer
+    pthread_t thread;
+    pthread_attr_t attr;
+    size_t stacksize = DEFAULT_THREAD_STACKSIZE;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, stacksize);
+
+    pthread_create(&thread, &attr, lwip_timeouts_thread, NULL);
+    pthread_attr_destroy(&attr);
+
+    // Adjust thread priority if needed
+    struct sched_param param;
+    param.sched_priority = DEFAULT_THREAD_PRIO;
+
+    pthread_setschedparam(thread, SCHED_OTHER, &param);
+    struct rte_mbuf *rx_mbufs[MAX_PKT_BURST];
+
+    err_t err = dhcp_setup(&netif);
+    printf("dhcp_setup err - %d\n", err);
+    // While waiting for DHCP, perform minimal receipt loop
+    printf("Awaiting DHCP...\n");
+    while (dhcp_addr_supplied(&netif) == 0)
+    {
+        unsigned short i, nb_rx = rte_eth_rx_burst(0 /* port id */, 0 /* queue id */, rx_mbufs, MAX_PKT_BURST);
+        for (i = 0; i < nb_rx; i++)
+        {
+            struct pbuf *p;
+
+            #ifdef ZEROCOPY
+            assert((p = alloc_custom_pbuf(rx_mbufs[i])) != NULL);
+            
+            #else
+            assert((p = pbuf_alloc(PBUF_RAW, rte_pktmbuf_pkt_len(rx_mbufs[i]), PBUF_POOL)) != NULL);
+            pbuf_take(p, rte_pktmbuf_mtod(rx_mbufs[i], void *), rte_pktmbuf_pkt_len(rx_mbufs[i]));
+            p->len = p->tot_len = rte_pktmbuf_pkt_len(rx_mbufs[i]);
+            #endif
+
+            assert(netif.input(p, &netif) == ERR_OK);
+            
+            #ifndef ZEROCOPY
+            rte_pktmbuf_free(rx_mbufs[i]);
+            #endif
         }
     }
+    printf("\n\n\n\n #### DHCP REGISTERED #### \n\n\n\n");
+    
+    // Set up UDP
+    udp_init();
+    assert((upcb = udp_new()) != NULL);
+    udp_bind(upcb, IP_ANY_TYPE, 1234);
+    udp_recv(upcb, udp_recv_handler, upcb);
 
-    if (printable && data_len > 0) {
-        printf("\"");
-        for (int i = 0; i < data_len; i++) {
-            if (data[i] == '\n') printf("\\n");
-            else if (data[i] == '\r') printf("\\r");
-            else if (data[i] == '\t') printf("\\t");
-            else printf("%c", data[i]);
-        }
-        printf("\"\n");
-    } else {
-        printf("[");
-        for (int i = 0; i < data_len && i < 32; i++) {
-            printf("%02x%s", data[i], (i < data_len - 1) ? " " : "");
-        }
-        if (data_len > 32) printf("...");
-        printf("]\n");
-    }
-}
+    // Send a packet to the gateway to force LWIP to add it to the etharp cache.
+    udp_sendto(upcb, pbuf_alloc(PBUF_RAW, 0, PBUF_POOL), &netif.gw, 1234);
+    
 
-static void echo_udp_packet(struct rte_mbuf *pkt, uint16_t port_id)
-{
-    struct rte_ether_hdr *eth_hdr;
-    struct rte_ipv4_hdr *ipv4_hdr;
-    struct rte_udp_hdr *udp_hdr;
-    uint8_t *udp_data;
-    uint16_t udp_data_len;
-
-    eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
-    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + sizeof(struct rte_ether_hdr));
-    udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + (ipv4_hdr->version_ihl & 0x0F) * 4);
-
-    // Get UDP data
-    udp_data = (uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr);
-    udp_data_len = rte_be_to_cpu_16(udp_hdr->dgram_len) - sizeof(struct rte_udp_hdr);
-
-    // Print received packet info
-    print_udp_info(ipv4_hdr, udp_hdr, udp_data, udp_data_len, "RX");
-
-    // Swap Ethernet addresses
-    struct rte_ether_addr tmp_eth;
-    rte_ether_addr_copy(&eth_hdr->dst_addr, &tmp_eth);
-    rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-    rte_ether_addr_copy(&tmp_eth, &eth_hdr->src_addr);
-
-    // Swap IP addresses
-    uint32_t tmp_ip = ipv4_hdr->src_addr;
-    ipv4_hdr->src_addr = ipv4_hdr->dst_addr;
-    ipv4_hdr->dst_addr = tmp_ip;
-
-    // Swap UDP ports
-    uint16_t tmp_port = udp_hdr->src_port;
-    udp_hdr->src_port = udp_hdr->dst_port;
-    udp_hdr->dst_port = tmp_port;
-
-    // Recalculate checksums
-    ipv4_hdr->hdr_checksum = 0;
-    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
-
-    udp_hdr->dgram_cksum = 0;
-    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, udp_hdr);
-
-    // Print echo packet info
-    print_udp_info(ipv4_hdr, udp_hdr, udp_data, udp_data_len, "TX");
-
-    // Send the packet back
-    uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &pkt, 1);
-    if (nb_tx == 0) {
-        printf("Failed to send echo packet\n");
-        rte_pktmbuf_free(pkt);
-    }
-}
-
-static void handle_udp_packet(struct rte_mbuf *mbuf, uint16_t port_id)
-{
-    struct rte_ether_hdr *eth_hdr;
-    struct rte_ipv4_hdr *ipv4_hdr;
-    struct rte_udp_hdr *udp_hdr;
-    uint8_t *udp_data;
-    uint16_t udp_data_len;
-
-    eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + sizeof(struct rte_ether_hdr));
-    udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + (ipv4_hdr->version_ihl & 0x0F) * 4);
-
-    // Calculate UDP data pointer and length
-    udp_data = (uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr);
-    udp_data_len = rte_be_to_cpu_16(udp_hdr->dgram_len) - sizeof(struct rte_udp_hdr);
-
-    // Print UDP data
-    if (udp_data_len > 0) {
-        echo_udp_packet(mbuf, port_id);
-    } else {
-        printf("No UDP data\n");
-    }
-    printf("===========================\n");
-}
-
-void run_udp_echoserver(uint16_t port_id)
-{
-    struct rte_mbuf *bufs[BURST_SIZE];
-    uint16_t nb_rx, i;
-
-    printf("UDP Echoserver running...\n");
-
-    // Check link status
-    struct rte_eth_link link;
-    int ret = rte_eth_link_get_nowait(port_id, &link);
-    if (ret == 0) {
-        printf("Link: %s, Speed: %u\n",
-               link.link_status ? "UP" : "DOWN", link.link_speed);
-    }
-
-    while (true) {
-        /* receive packets */
-        nb_rx = rte_eth_rx_burst(port_id, 0, bufs, BURST_SIZE);
-
-        if (nb_rx == 0) // If no packets were received, continue to the next iteration
-            continue;
-
-        /* Process each packet */
-        for (i = 0; i < nb_rx; i++) {
-            struct rte_ether_hdr *eth_hdr;
-            uint16_t ether_type;
-
-            eth_hdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
-            ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
-
-            printf("received a packet - type: 0x%x!\n", ether_type);
-
-            if (ether_type == RTE_ETHER_TYPE_ARP) {
-                handle_arp_packet(bufs[i], port_id);
-            } else if (ether_type == RTE_ETHER_TYPE_IPV4) {
-                struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-
-                if (ip_hdr->next_proto_id == IPPROTO_UDP) {
-                    handle_udp_packet(bufs[i], port_id);
-                } else {
-                    rte_pktmbuf_free(bufs[i]);
-                }
-            } else {
-                rte_pktmbuf_free(bufs[i]);
+    /* primary loop */
+    while (1)
+    {   
+        unsigned short i, nb_rx = rte_eth_rx_burst(0 /* port id */, 0 /* queue id */, rx_mbufs, MAX_PKT_BURST);
+        
+#ifdef BURST_DELAY
+        for (int i = 0; i < BURST_DELAY; i++)
+            asm volatile("NOP");
+#endif
+        
+        for (i = 0; i < nb_rx; i++)
+        {
+#ifdef DEBUG
+            uint8_t *data = rte_pktmbuf_mtod(rx_mbufs[i], uint8_t *);
+            uint32_t len = rte_pktmbuf_pkt_len(rx_mbufs[i]);
+            for (uint32_t j = 0; j < len; j++)
+            {
+                printf("%02X ", data[j]);
+                if ((j + 1) % 16 == 0)
+                    printf("\n");
             }
+            printf("\n");
+#endif
+            struct pbuf *p;
+
+            #ifdef ZEROCOPY
+            assert((p = alloc_custom_pbuf(rx_mbufs[i])) != NULL);
+            
+            #else
+            assert((p = pbuf_alloc(PBUF_RAW, rte_pktmbuf_pkt_len(rx_mbufs[i]), PBUF_POOL)) != NULL);
+            pbuf_take(p, rte_pktmbuf_mtod(rx_mbufs[i], void *), rte_pktmbuf_pkt_len(rx_mbufs[i]));
+            p->len = p->tot_len = rte_pktmbuf_pkt_len(rx_mbufs[i]);
+            #endif
+
+            assert(netif.input(p, &netif) == ERR_OK);
+            
+            #ifndef ZEROCOPY
+            rte_pktmbuf_free(rx_mbufs[i]);
+            #endif
         }
+        tx_flush();
     }
 }
 
 int main(int argc, char *argv[])
 {
+    // Initialise utilisation socket
+    // int pid = fork();
+    // if (pid > 0) {
+    //     execl("./utilisationsocket", "utilisation", NULL);
+    //     assert(0 && "Failed to start utilisation socket!");
+    // }
+
+    // # DPDK init #
+    unsigned nb_ports;
+    uint16_t portid;
     int ret;
-    uint16_t nb_ports;
-    uint16_t port_id;
 
-    printf("Initializing DPDK EAL...\n");
-    ret = rte_eal_init(argc, argv);
-    if (ret < 0) {
-        printf("EAL initialization failed: %d\n", ret);
-        return -1;
+
+    // Start EAL
+    if ((ret = rte_eal_init(argc, argv)) < 0)
+    {
+        rte_exit(EXIT_FAILURE, "EAL failed to initialise\n");
     }
-
-    printf("EAL initialized successfully\n");
-
-    nb_ports = rte_eth_dev_count_avail();
-
-    if (nb_ports == 0) {
-        printf("No Ethernet ports found!\n");
-        printf("Make sure to use: --vdev='net_enetfec'\n");
-        return -1;
-    } else {
-        printf("Available Ethernet ports: %u\n", nb_ports);
-    }
-
-    ret = rte_eth_dev_is_valid_port(DPDK_PORT);
-    if (ret == 0) {
-        printf("The target port %u is not valid\n", DPDK_PORT);
-        return -1;
-    }
-    printf("Port %d is valid.\n", DPDK_PORT);
 
     // Allocate rx mempool
-    printf("Creating mbuf_pool for RX...\n");
-    assert((pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_rx_pool",
-                                                   NUM_MBUFS,
-                                                   MBUF_CACHE_SIZE,
-                                                   0,
-                                                   RTE_MBUF_DEFAULT_BUF_SIZE,
+    assert((pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool",
+                                                   RTE_MAX(1 /* nb_ports */ * (RING_SIZE * 2 + MAX_PKT_BURST + 1 * MEMPOOL_CACHE_SIZE), 8192),
+                                                   MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
                                                    rte_socket_id())) != NULL);
-    if (pktmbuf_pool == NULL) {
-        printf("Failed to create mbufpool\n");
-        return -1;
+    if (pktmbuf_pool == NULL)
+        rte_exit(EXIT_FAILURE, "mbuf pool could not be created!\n");
+
+    // Set up ports
+    RTE_ETH_FOREACH_DEV(portid)
+    {
+        if (port_init(portid, pktmbuf_pool) != 0)
+            rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n",
+                     portid);
+        break; // only do one port for now
     }
 
-    // Allocate tx mempool
-    printf("Creating mbuf_pool for TX...\n");
-    assert((tx_mbuf_pool = rte_pktmbuf_pool_create("mbuf_tx_pool",
-                                                   NUM_MBUFS,
-                                                   MBUF_CACHE_SIZE,
-                                                   0,
-                                                   RTE_MBUF_DEFAULT_BUF_SIZE,
-                                                   rte_socket_id())) != NULL);
-    if (pktmbuf_pool == NULL) {
-        printf("Failed to create mbufpool\n");
-        return -1;
-    }
+    
 
+    // Sanity checks
+    if (rte_lcore_count() > 1)
+        printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
 
-    printf("Initialising the port %d\n", DPDK_PORT);
-    ret = port_init(DPDK_PORT, pktmbuf_pool);
-    if (ret != 0) {
-        printf("Faield to init port %u\n", DPDK_PORT);
-        return -1;
-    }
-    printf("Network device initialisation successful!\n");
+    // Start main loop
+    lcore_main();
 
-    print_dev_info(DPDK_PORT);
-    run_udp_echoserver(DPDK_PORT);
-    /* run_udp_sender(DPDK_PORT); */
-
-    printf("Stopping port %u...\n", DPDK_PORT);
-    ret = rte_eth_dev_stop(DPDK_PORT);
-    if (ret != 0) {
-        printf("Failed to stop port %u: %s\n", DPDK_PORT, strerror(-ret));
-    } else {
-        printf("Port %u stopped successfully\n", DPDK_PORT);
-    }
-
-    printf("Closing port %u...\n", DPDK_PORT);
-    ret = rte_eth_dev_close(DPDK_PORT);
-    if (ret != 0) {
-        printf("Failed to close port %u: %d\n", DPDK_PORT, ret);
-    }
-
-    // Final cleanup
-    ret = rte_eal_cleanup();
-    if (ret != 0) {
-        printf("EAL cleanup failed: %d\n", ret);
-    } else {
-        printf("EAL cleanup successful\n");
-    }
-
+    // Cleanup and die
+    rte_eal_cleanup();
     return 0;
 }
