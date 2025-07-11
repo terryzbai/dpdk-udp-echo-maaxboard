@@ -7,7 +7,7 @@
 // 07/2023
 
 // Uncomment below for debugging output
-#define DEBUG
+/* #define DEBUG */
 
 // Uncomment below for zero copy LWIP - note that this inexplicably makes things slower
 // #define ZEROCOPY
@@ -15,6 +15,7 @@
 // Uncomment below for artificial per-burst delay. You can set number of cycles delay with this
 #define BURST_DELAY 10UL
 #define HW_NO_CKSUM_OFFLOAD
+#define UDP_PORT 1235
 
 #include "main.h"
 
@@ -89,22 +90,6 @@ static void tx_flush(void)
 
     mbuf_count = 0;
 
-    // print packet
-    #ifdef DEBUG
-    printf("Emitted %d packets\n", emitted);
-
-    uint8_t *udp_data = (uint8_t *)rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *);
-    uint16_t len = rte_pktmbuf_pkt_len(tx_mbufs[mbuf_count]);
-    printf("==============udp data==============\n");
-    // Print packet
-    for (int i = 0; i < len; i++)
-    {
-        printf("%02x ", udp_data[i]);
-        if (i % 16 == 15)
-            printf("\n");
-    }
-
-    #endif
 }
 
 // Function to output packets for lwip
@@ -152,36 +137,11 @@ static err_t tx_output(struct netif *netif __attribute__((unused)), struct pbuf 
     struct rte_ipv4_hdr *ip_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
     struct rte_udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(tx_mbufs[mbuf_count], struct rte_udp_hdr *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
 
-    printf("\nbuf: 0x%x 0x%x\n", ((unsigned char *)bufptr)[70], ((unsigned char *)bufptr)[71]);
-
     assert(p->tot_len <= RTE_MBUF_DEFAULT_BUF_SIZE);
     rte_memcpy(rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *), bufptr, p->tot_len);
     rte_pktmbuf_pkt_len(tx_mbufs[mbuf_count]) = rte_pktmbuf_data_len(tx_mbufs[mbuf_count]) = p->tot_len;
 
     udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
-    /* ip_hdr->hdr_checksum = 0; */
-    printf("ip cksum: 0x%x\n", rte_be_to_cpu_32(rte_ipv4_cksum(ip_hdr)));
-
-    printf("ether hdr address: 0x%x\n", eth_hdr);
-    printf("ipv4 hdr address: 0x%x\n", ip_hdr);
-    printf("udp hdr address: 0x%x\n", udp_hdr);
-    printf("data address (udp_hdr): 0x%x\n", rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *));
-    struct rte_udp_hdr *test_udp_hdr = (struct rte_udp_hdr *)((char *)ip_hdr + (ip_hdr->version_ihl & 0x0F) * 4);
-    printf("rte_udp_hdr addr: 0x%x, dgram_len: %u\n", test_udp_hdr, (uint16_t)test_udp_hdr->dgram_len);
-    /* uint8_t *udp_data = ((uint8_t *)ip_hdr + (ip_hdr->version_ihl & 0x0F) * 4) + sizeof(struct rte_udp_hdr); */
-    uint8_t *udp_data = (uint8_t *)rte_pktmbuf_mtod(tx_mbufs[mbuf_count], void *);
-    printf("data address (rte_udp_hdr): 0x%x\n", udp_data);
-
-#ifdef DEBUG
-    printf("==============udp data==============\n");
-    // Print packet
-    for (int i = 0; i < p->tot_len; i++)
-    {
-        printf("%02x ", udp_data[i]);
-        if (i % 16 == 15)
-            printf("\n");
-    }
-#endif
 
 
     // Enable offloads in mbufs
@@ -378,7 +338,7 @@ static __rte_noreturn void lcore_main(void)
     // LWIP setup
     ip4_addr_t _addr, _mask, _gate;
 
-    inet_pton(AF_INET, "255.255.255.0", &_mask);
+    inet_pton(AF_INET, "255.255.0.0", &_mask);
     inet_pton(AF_INET, "0.0.0.0", &_gate);
     inet_pton(AF_INET, "0.0.0.0", &_addr);
 
@@ -421,7 +381,7 @@ static __rte_noreturn void lcore_main(void)
 
             #ifdef ZEROCOPY
             assert((p = alloc_custom_pbuf(rx_mbufs[i])) != NULL);
-            
+
             #else
             assert((p = pbuf_alloc(PBUF_RAW, rte_pktmbuf_pkt_len(rx_mbufs[i]), PBUF_POOL)) != NULL);
             pbuf_take(p, rte_pktmbuf_mtod(rx_mbufs[i], void *), rte_pktmbuf_pkt_len(rx_mbufs[i]));
@@ -429,18 +389,18 @@ static __rte_noreturn void lcore_main(void)
             #endif
 
             assert(netif.input(p, &netif) == ERR_OK);
-            
+
             #ifndef ZEROCOPY
             rte_pktmbuf_free(rx_mbufs[i]);
             #endif
         }
     }
     printf("\n\n\n\n #### DHCP REGISTERED #### \n\n\n\n");
-    
+
     // Set up UDP
     udp_init();
     assert((upcb = udp_new()) != NULL);
-    udp_bind(upcb, IP_ANY_TYPE, 1234);
+    udp_bind(upcb, IP_ANY_TYPE, UDP_PORT);
     udp_recv(upcb, udp_recv_handler, upcb);
 
     // Send a packet to the gateway to force LWIP to add it to the etharp cache.

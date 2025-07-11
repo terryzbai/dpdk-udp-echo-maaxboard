@@ -20,9 +20,6 @@
      ((uint32_t) c << 8) | (uint32_t) d)
 
 #define DPDK_PORT 0
-#define CLIENT_IP IP_ADDR(172, 16, 1, 100)
-#define CLIENT_PORT 1235
-#define SERVER_IP IP_ADDR(255, 255, 255, 255)
 #define SERVER_PORT 1235
 #define PAYLOAD_LEN 22
 
@@ -429,11 +426,11 @@ void run_udp_echoserver(uint16_t port_id)
             printf("received a packet - type: 0x%x!\n", ether_type);
 
             if (ether_type == RTE_ETHER_TYPE_ARP) {
-                handle_arp_packet(bufs[i], port_id);
+                /* handle_arp_packet(bufs[i], port_id); */
             } else if (ether_type == RTE_ETHER_TYPE_IPV4) {
                 struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
 
-                if (ip_hdr->next_proto_id == IPPROTO_UDP) {
+                if (ip_hdr->next_proto_id == IPPROTO_UDP && ) {
                     handle_udp_packet(bufs[i], port_id);
                 } else {
                     rte_pktmbuf_free(bufs[i]);
