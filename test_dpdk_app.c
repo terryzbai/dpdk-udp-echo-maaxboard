@@ -29,10 +29,9 @@
      ((uint32_t) c << 8) | (uint32_t) d)
 
 #define DPDK_PORT 0
-/* #define SERVER_IP RTE_IPV4(172, 16, 1, 200) */
-#define SERVER_IP RTE_IPV4(10, 0, 2, 15)
+#define SERVER_IP RTE_IPV4(172, 16, 4, 200)
+/* #define SERVER_IP RTE_IPV4(10, 0, 2, 15) */
 #define SERVER_PORT 1235
-#define PAYLOAD_LEN 22
 
 /* offload checksum calculations */
 static const struct rte_eth_conf port_conf = {
@@ -390,6 +389,41 @@ static void handle_udp_packet(struct rte_mbuf *mbuf, uint16_t port_id)
     LOG_DEBUG("===========================\n");
 }
 
+
+static inline void dcache_invalidate_range(void *addr, size_t size) {
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end = start + size;
+    uintptr_t cache_line_size = 64; // ARM64 cache line size
+
+    // Align to cache line boundaries
+    start &= ~(cache_line_size - 1);
+    LOG_DEBUG("Invalidate cache: 0x%x - 0x%x\n", start, end);
+
+    for (uintptr_t va = start; va < end; va += cache_line_size) {
+        asm volatile("dc civac, %0" : : "r" (va) );
+    }
+
+    // Data synchronization barrier
+    asm volatile("dsb sy" : : : "memory");
+    /* asm volatile("dmb sy" : : : "memory"); */
+}
+
+static inline void dcache_clean_range(void *addr, size_t size) {
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end = start + size;
+    uintptr_t cache_line_size = 64;
+
+    start &= ~(cache_line_size - 1);
+    LOG_DEBUG("Clean cache: 0x%x - 0x%x\n", start, end);
+
+    for (uintptr_t va = start; va < end; va += cache_line_size) {
+        asm volatile("dc cvac, %0" : : "r" (va) : "memory");
+    }
+
+    asm volatile("dsb sy" : : : "memory");
+    /* asm volatile("dmb sy" : : : "memory"); */
+}
+
 void run_udp_echoserver(uint16_t port_id)
 {
     struct rte_mbuf *bufs[BURST_SIZE];
@@ -414,6 +448,12 @@ void run_udp_echoserver(uint16_t port_id)
 
         /* Process each packet */
         for (i = 0; i < nb_rx; i++) {
+            void *pkt_data = rte_pktmbuf_mtod(bufs[i], void *);
+            uint16_t data_len = rte_pktmbuf_data_len(bufs[i]);
+
+            // Invalidate cache before reading DMA data
+            dcache_invalidate_range(pkt_data, data_len);
+
             struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
             uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
 
